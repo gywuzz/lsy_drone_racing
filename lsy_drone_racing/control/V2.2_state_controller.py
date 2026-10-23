@@ -21,7 +21,7 @@ class V2StateController(Controller):
         super().__init__(obs, info, config)
 
         self._freq = float(config.env.freq)
-        self._cruise_speed = 1.00
+        self._cruise_speed = 0.90
         self._alignment_speed = 0.45
         self._gate_speed = 0.36
         self._gate_offset = 0.45

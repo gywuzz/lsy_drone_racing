@@ -33,8 +33,8 @@ class V2StateController(Controller):
         self._obstacle_clearance = 0.30
         self._avoidance_margin = 0.08
         self._avoidance_lookahead = 0.28
-        self._entry_tolerance = 0.09
-        self._alignment_tolerance = 0.10
+        self._entry_tolerance = 0.12
+        self._alignment_tolerance = 0.12
         self._exit_tolerance = 0.18
         self._tracking_slowdown_distance = 0.45
 
@@ -46,7 +46,7 @@ class V2StateController(Controller):
         self._over_gate_clearance = 0.30  # Extra height above the frame top [m]
         self._over_gate_behind_distance = 0.30  # Min. distance behind the gate plane to climb [m]
         # level2.toml: pos_limit_high z = 2.0 m -> keep a margin for tracking overshoot.
-        self._max_flight_height = 1.85  # Highest setpoint used for the over-the-gate route [m]
+        self._max_flight_height = 1.75  # Highest setpoint used for the over-the-gate route [m]
 
         self._pass_index = int(obs["n_gates_passed"])
         self._pending_pass_index: int | None = None

@@ -254,13 +254,8 @@ class V2StateController(Controller):
                 clearance = np.inf
             candidates.append((clearance, path_length, outside_exit, outside_entry))
 
-        required_clearance = (self._obstacle_clearance + self._avoidance_margin)
         safe = [item for item in candidates if item[0] >= self._obstacle_clearance]
-        if safe:
-            selected = min(safe, key=lambda item: item[1])
-        else:
-            selected = max(candidates, key=lambda item: item[0])
-        # selected = min(safe or candidates, key=lambda item: item[1])
+        selected = min(safe or candidates, key=lambda item: item[1])
         return [selected[2], selected[3]]
 
     def _route_is_clear(self, start: NDArray[np.float64], waypoints: list[NDArray[np.float64]], obstacles: NDArray[np.float64],

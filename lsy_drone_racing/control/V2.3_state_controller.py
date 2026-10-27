@@ -254,7 +254,7 @@ class V2StateController(Controller):
             candidates.append((clearance, path_length, outside_exit, outside_entry))
 
         safe = [item for item in candidates if item[0] >= self._obstacle_clearance]
-        selected = min(safe or candidates, key=lambda item: item[1])
+        selected = max(safe or candidates, key=lambda item: item[0])
         return [selected[2], selected[3]]
 
     def _build_over_gate_bypass(

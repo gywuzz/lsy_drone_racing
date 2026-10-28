@@ -40,6 +40,7 @@ class V2StateController(Controller):
         self._tracking_slowdown_distance = 0.45
 
         self._initial_transfer_clearance = self._obstacle_clearance + self._avoidance_margin
+        self._first_gate_approach_speed = 0.55
         self._first_gate_climb_offset = 0.42
         self._first_gate_plan_switch_offset = 0.22
         self._first_gate_climb_speed = 0.50
@@ -157,7 +158,10 @@ class V2StateController(Controller):
 
         obstacles = self._available_obstacles(obs)
         if self._pass_index == 0:
-            entry = self._centerline_first_gate_entry(center, normal, obstacles)
+            # Gate 1 uses the standard 0.45 m centerline entry.  Do not move it sideways or
+            # closer to the frame: the transfer planner handles the pole before this point,
+            # while the fixed entry gives the drone enough distance to align with the opening.
+            entry = calculated_entry.copy()
         else:
             entry = self._move_staging_point(entry, normal, obstacles)
         exit_point = self._move_staging_point(
@@ -168,32 +172,6 @@ class V2StateController(Controller):
         self._current_normal = normal
         self._current_entry = entry
         self._current_exit = exit_point
-
-    def _centerline_first_gate_entry(
-        self,
-        center: NDArray[np.float64],
-        normal: NDArray[np.float64],
-        obstacles: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        """Keep gate 1's approach centered instead of shifting it toward a side frame."""
-        offsets = np.linspace(
-            self._gate_alignment_start_offset, self._gate_alignment_offset, 10
-        )
-        candidates = [center - offset * normal for offset in offsets]
-        if not len(obstacles):
-            return candidates[0]
-        for candidate in candidates:
-            clearance = np.min(
-                np.linalg.norm(obstacles[:, :2] - candidate[:2], axis=1)
-            )
-            if clearance >= self._initial_transfer_clearance:
-                return candidate
-        return max(
-            candidates,
-            key=lambda point: np.min(
-                np.linalg.norm(obstacles[:, :2] - point[:2], axis=1)
-            ),
-        )
 
     def _refresh_current_gate_if_observed(
         self, obs: dict[str, NDArray[np.floating]]
@@ -307,7 +285,12 @@ class V2StateController(Controller):
             )
         )
         self._phase = "TO_ENTRY"
-        self._set_local_plan(waypoints, self._cruise_speed)
+        approach_speed = (
+            self._first_gate_approach_speed
+            if self._pass_index == 0 and departure_gate is None
+            else self._cruise_speed
+        )
+        self._set_local_plan(waypoints, approach_speed)
 
     def _plan_first_to_second_entry_leg(
         self, obs: dict[str, NDArray[np.floating]]
@@ -664,7 +647,13 @@ class V2StateController(Controller):
             # The entry is only a staging target.  If disturbances or an obstacle prevent the
             # drone from reaching its strict radius, move on to the centered alignment target once
             # the entry trajectory has completed instead of holding forever.
-            if entry_reached or self._local_plan_finished():
+            first_gate_settled = (
+                self._pass_index == 0
+                and self._local_plan_finished()
+                and np.linalg.norm(position - self._current_entry) < 0.16
+            )
+            other_plan_finished = self._pass_index != 0 and self._local_plan_finished()
+            if entry_reached or first_gate_settled or other_plan_finished:
                 self._overhead_transfer_active = False
                 self._first_to_second_transfer_active = False
                 self._departure_gate = None  # [CHANGE 2]

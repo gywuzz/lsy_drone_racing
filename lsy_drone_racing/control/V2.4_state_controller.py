@@ -29,10 +29,7 @@ class V2StateController(Controller):
         self._gate_alignment_offset = 0.12
         self._gate_bypass_offset = 0.62
         self._takeoff_height = 0.45
-        self._takeoff_tolerance = 0.06
-        self._takeoff_settle_speed = 0.15
-        self._takeoff_settle_steps_required = max(1, int(round(0.20 * self._freq)))
-        self._takeoff_settle_steps = 0
+        self._takeoff_tolerance = 0.10
         self._minimum_segment_time = 0.24
         self._obstacle_clearance = 0.30
         self._avoidance_margin = 0.08
@@ -242,7 +239,6 @@ class V2StateController(Controller):
             takeoff[2] = self._takeoff_height
             waypoints.append(takeoff)
             self._phase = "TAKEOFF_SETTLE"
-            self._takeoff_settle_steps = 0
             self._set_local_plan(waypoints, self._alignment_speed)
             return
 
@@ -661,12 +657,7 @@ class V2StateController(Controller):
         position = np.asarray(obs["pos"], dtype=np.float64)
         if self._phase == "TAKEOFF_SETTLE":
             altitude_error = abs(float(position[2] - self._takeoff_height))
-            speed = np.linalg.norm(np.asarray(obs["vel"], dtype=np.float64))
-            if altitude_error < self._takeoff_tolerance and speed < self._takeoff_settle_speed:
-                self._takeoff_settle_steps += 1
-            else:
-                self._takeoff_settle_steps = 0
-            if self._takeoff_settle_steps >= self._takeoff_settle_steps_required:
+            if self._local_plan_finished() and altitude_error < self._takeoff_tolerance:
                 self._plan_to_entry(obs, include_takeoff=False)
         elif self._phase == "TO_ENTRY":
             entry_reached = np.linalg.norm(position - self._current_entry) < self._entry_tolerance

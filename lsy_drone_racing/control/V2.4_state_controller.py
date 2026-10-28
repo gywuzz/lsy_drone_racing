@@ -39,9 +39,10 @@ class V2StateController(Controller):
         self._tracking_slowdown_distance = 0.45
 
         # Start -> gate 1: only detour for obstacles that truly enter a narrow flight corridor.
-        self._initial_transfer_clearance = 0.30
+        self._initial_transfer_clearance = self._obstacle_clearance + self._avoidance_margin
         # Gate 1 -> gate 2: clear the first gate before climbing toward the higher second gate.
         self._first_gate_climb_offset = 0.42
+        self._first_gate_plan_switch_offset = 0.22
         self._first_gate_climb_speed = 0.50
         self._height_difference_threshold = 0.08
         self._second_gate_turn_distance = 0.42
@@ -157,7 +158,14 @@ class V2StateController(Controller):
                 self._recorded_entries[self._current_gate_id] = entry.copy()
 
         obstacles = self._available_obstacles(obs)
-        entry = self._move_staging_point(entry, normal, obstacles)
+        if self._pass_index == 0:
+            # Gate 1's nominal 0.45 m entry lies close to the first pole.  Moving that point
+            # laterally creates an oblique final approach that can clip the gate frame.  Keep
+            # the staging point on the gate normal and move it longitudinally toward the gate
+            # until it has enough pole clearance.
+            entry = self._centerline_first_gate_entry(center, normal, obstacles)
+        else:
+            entry = self._move_staging_point(entry, normal, obstacles)
         exit_point = self._move_staging_point(
             center + self._gate_offset * normal, normal, obstacles
         )
@@ -166,6 +174,37 @@ class V2StateController(Controller):
         self._current_normal = normal
         self._current_entry = entry
         self._current_exit = exit_point
+
+    def _centerline_first_gate_entry(
+        self,
+        center: NDArray[np.float64],
+        normal: NDArray[np.float64],
+        obstacles: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Keep gate 1's approach centered instead of shifting it toward a side frame."""
+        offsets = np.linspace(
+            self._gate_alignment_start_offset,
+            self._gate_alignment_offset,
+            10,
+        )
+        candidates = [center - offset * normal for offset in offsets]
+        if not len(obstacles):
+            return candidates[0]
+
+        # Prefer the furthest centerline point that is clear.  If randomization makes every
+        # candidate tight, use the maximum-clearance point while still remaining centered.
+        for candidate in candidates:
+            clearance = np.min(
+                np.linalg.norm(obstacles[:, :2] - candidate[:2], axis=1)
+            )
+            if clearance >= self._initial_transfer_clearance:
+                return candidate
+        return max(
+            candidates,
+            key=lambda point: np.min(
+                np.linalg.norm(obstacles[:, :2] - point[:2], axis=1)
+            ),
+        )
 
     def _refresh_current_gate_if_observed(
         self, obs: dict[str, NDArray[np.floating]]
@@ -699,6 +738,23 @@ class V2StateController(Controller):
                 self._first_to_second_transfer_active = False
                 self._departure_gate = None
                 self._plan_gate_alignment(obs)
+        elif (
+            self._phase == "FIRST_GATE_CLEAR"
+            and self._pending_pass_index is not None
+        ):
+            normal_h = np.array(
+                [self._current_normal[0], self._current_normal[1], 0.0],
+                dtype=np.float64,
+            )
+            normal_h /= max(np.linalg.norm(normal_h), 1e-9)
+            forward_distance = float(
+                np.dot(position - self._current_center, normal_h)
+            )
+            if (
+                forward_distance >= self._first_gate_plan_switch_offset
+                or self._local_plan_finished()
+            ):
+                self._plan_first_gate_departure(obs)
         elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
             exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
             if exit_reached or self._local_plan_finished():
@@ -784,14 +840,16 @@ class V2StateController(Controller):
         if not self._finished and gates_passed > self._pass_index:
             first_exit_update = self._pending_pass_index is None
             self._pending_pass_index = gates_passed
-            self._phase = "TO_EXIT"
-            if self._pass_index == 0 and first_exit_update:
-                self._plan_first_gate_departure(obs)
-            elif (
-                self._pass_index == self._vertical_departure_pass_index
-                and first_exit_update
-            ):
-                self._plan_third_gate_departure(obs)
+            if first_exit_update:
+                if self._pass_index == 0:
+                    # Gate passage is counted at its plane.  Keep following the already smooth
+                    # crossing spline until the whole drone is clear of gate 1 before replanning.
+                    self._phase = "FIRST_GATE_CLEAR"
+                elif self._pass_index == self._vertical_departure_pass_index:
+                    self._phase = "TO_EXIT"
+                    self._plan_third_gate_departure(obs)
+                else:
+                    self._phase = "TO_EXIT"
         return self._finished
 
     def episode_callback(self):

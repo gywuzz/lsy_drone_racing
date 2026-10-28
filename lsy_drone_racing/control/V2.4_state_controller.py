@@ -73,6 +73,7 @@ class V2StateController(Controller):
         self._desired_yaw = 0.0
         self._overhead_transfer_active = False
         self._overhead_transfer_height = 0.0
+        self._first_to_second_transfer_active = False
 
         self._known_gate_poses: dict[
             int, tuple[NDArray[np.float64], NDArray[np.float64]]
@@ -222,7 +223,12 @@ class V2StateController(Controller):
         # [CHANGE 2] A re-plan inside TO_ENTRY (newly seen gate/pole) used to call this without
         # departure_gate, so the bypass vanished and the new straight line could lead back
         # through the gate just passed.  Reuse the stored gate instead.
-        if departure_gate is None:
+        if self._first_to_second_transfer_active:
+            # Gate 1 has already been cleared by the dedicated forward-and-climb departure.
+            # Do not send the drone back over/around it, including after sensor-triggered replans.
+            departure_gate = None
+            self._departure_gate = None
+        elif departure_gate is None:
             departure_gate = self._departure_gate
         else:
             self._departure_gate = (departure_gate[0].copy(), departure_gate[1].copy())
@@ -384,6 +390,7 @@ class V2StateController(Controller):
         climb = forward.copy()
         climb[2] = min(float(next_center[2]), self._max_flight_height)
         self._current_exit = climb.copy()
+        self._first_to_second_transfer_active = True
         self._phase = "TO_EXIT"
         self._set_local_plan([start, forward, climb], self._first_gate_climb_speed)
 
@@ -624,6 +631,7 @@ class V2StateController(Controller):
             # the entry trajectory has completed instead of holding forever.
             if entry_reached or self._local_plan_finished():
                 self._overhead_transfer_active = False
+                self._first_to_second_transfer_active = False
                 self._departure_gate = None  # [CHANGE 2]
                 self._plan_gate_alignment(obs)
         elif self._phase == "ALIGN_GATE":

@@ -25,6 +25,7 @@ class V2StateController(Controller):
         self._alignment_speed = 0.38
         self._gate_speed = 0.80
         self._gate_offset = 0.45
+        self._gate_departure_offset = 0.80
         self._gate_alignment_start_offset = 0.30
         self._gate_alignment_offset = 0.12
         self._gate_bypass_offset = 0.62
@@ -139,8 +140,11 @@ class V2StateController(Controller):
 
         obstacles = self._available_obstacles(obs)
         entry = self._move_staging_point(entry, normal, obstacles)
+        # Put the departure target beyond a pole located directly behind a gate.
+        # In level 2 the pole behind gate 3 is only about 0.50 m from its centre;
+        # the old 0.45 m exit target stopped immediately in front of that pole.
         exit_point = self._move_staging_point(
-            center + self._gate_offset * normal, normal, obstacles
+            center + self._gate_departure_offset * normal, normal, obstacles
         )
 
         self._current_center = center.copy()
@@ -295,7 +299,7 @@ class V2StateController(Controller):
         return [climb, above_center, front]
 
     def _plan_through_gate(self, obs: dict[str, NDArray[np.floating]]) -> None:
-        """Create a short crossing constrained to the gate normal."""
+        """Create a short, straight crossing constrained to the gate normal."""
         start = np.asarray(obs["pos"], dtype=np.float64)
         alignment_entry = (
             self._current_center - self._gate_alignment_offset * self._current_normal
@@ -303,20 +307,33 @@ class V2StateController(Controller):
         alignment_exit = (
             self._current_center + self._gate_alignment_offset * self._current_normal
         )
-        alignment_after = (
-            self._current_center
-            + self._gate_alignment_start_offset * self._current_normal
-        )
         waypoints = [
             start,
             alignment_entry,
             self._current_center,
             alignment_exit,
-            alignment_after,
-            self._current_exit,
         ]
         self._phase = "THROUGH_GATE"
         self._set_local_plan(waypoints, self._gate_speed)
+
+    def _plan_exit_clearance(
+        self, obs: dict[str, NDArray[np.floating]]
+    ) -> None:
+        """Clear the gate's exit side while routing around a nearby pole.
+
+        This is deliberately a separate plan from the high-speed gate crossing.
+        It starts as soon as the environment confirms the pass, so a pole behind
+        gate 3 cannot be hidden inside the tail of the through-gate spline.
+        """
+        start = np.asarray(obs["pos"], dtype=np.float64)
+        waypoints = [start]
+        waypoints.extend(
+            self._obstacle_aware_transfer(
+                start, self._current_exit, self._available_obstacles(obs)
+            )
+        )
+        self._phase = "TO_EXIT"
+        self._set_local_plan(waypoints, self._alignment_speed)
 
     def _alignment_start(
         self, obs: dict[str, NDArray[np.floating]]
@@ -587,7 +604,8 @@ class V2StateController(Controller):
 
         if not self._finished and gates_passed > self._pass_index:
             self._pending_pass_index = gates_passed
-            self._phase = "TO_EXIT"
+            if self._phase != "TO_EXIT":
+                self._plan_exit_clearance(obs)
         return self._finished
 
     def episode_callback(self):

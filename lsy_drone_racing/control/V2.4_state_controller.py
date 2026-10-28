@@ -44,6 +44,8 @@ class V2StateController(Controller):
         self._first_gate_climb_offset = 0.28
         self._first_gate_climb_speed = 0.50
         self._height_difference_threshold = 0.08
+        self._second_gate_turn_distance = 0.42
+        self._first_to_second_speed = 0.55
 
         # The third pass keeps its dedicated vertical departure toward gate 4.
         self._vertical_departure_pass_index = 2
@@ -218,6 +220,31 @@ class V2StateController(Controller):
             waypoints.extend([climb_or_hold, above_entry, self._current_entry.copy()])
             self._phase = "TO_ENTRY"
             self._set_local_plan(waypoints, self._vertical_departure_speed)
+            return
+
+        if self._first_to_second_transfer_active:
+            # Gate 1 and gate 2 face nearly opposite travel directions.  A direct connection
+            # creates a tangent-like hairpin.  Approach an outer turn point first, then return
+            # along gate 2's normal to form a predictable U-shaped transfer.
+            turn_point = (
+                self._current_entry
+                - self._second_gate_turn_distance * self._current_normal
+            )
+            turn_point[2] = max(float(route_start[2]), float(self._current_entry[2]))
+            obstacles = self._available_obstacles(obs)
+            first_leg = self._obstacle_aware_transfer(
+                route_start, turn_point, obstacles
+            )
+            waypoints.extend(first_leg)
+            second_leg_start = waypoints[-1]
+            waypoints.extend(
+                self._obstacle_aware_transfer(
+                    second_leg_start, self._current_entry, obstacles
+                )
+            )
+            self._departure_gate = None
+            self._phase = "TO_ENTRY"
+            self._set_local_plan(waypoints, self._first_to_second_speed)
             return
 
         # [CHANGE 2] A re-plan inside TO_ENTRY (newly seen gate/pole) used to call this without
@@ -751,5 +778,4 @@ class V2StateController(Controller):
         setpoint = self._local_spline(self._trajectory_time).reshape(1, -1)
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
         draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.025)
-
        

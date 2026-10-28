@@ -43,6 +43,7 @@ class V2StateController(Controller):
         self._vertical_departure_pass_index = 2
         self._vertical_departure_speed = 0.50
         self._third_gate_top_clearance = 0.18
+        self._third_gate_climb_offset = 0.20
         self._vertical_column_clearance = 0.28
         self._post_gate_corridor_width = 0.42
         self._post_gate_corridor_length = 0.90
@@ -376,8 +377,23 @@ class V2StateController(Controller):
         # This is intentionally based on the top of gate 3, not the top of the pole.  Once the
         # drone has climbed, the next segment heads directly away from that pole toward gate 4.
         transfer_z = max(float(start[2]), gate_clear_z)
+        # Gate passage is counted at the gate plane.  Move farther onto the exit side before
+        # climbing so the vertical segment cannot clip the upper frame.
+        climb_base = start.copy()
+        start_forward = float(np.dot(start - self._current_center, normal_h))
+        if start_forward < self._third_gate_climb_offset:
+            climb_base += (
+                self._third_gate_climb_offset - start_forward
+            ) * normal_h
+
         column_clearance = (
-            float(np.min(np.linalg.norm(obstacles[:, :2] - start[:2], axis=1)))
+            float(
+                np.min(
+                    np.linalg.norm(
+                        obstacles[:, :2] - climb_base[:2], axis=1
+                    )
+                )
+            )
             if len(obstacles)
             else np.inf
         )
@@ -387,12 +403,12 @@ class V2StateController(Controller):
         )
 
         if can_climb:
-            climb = start.copy()
+            climb = climb_base.copy()
             climb[2] = transfer_z
             # The vertical climb itself is the third-gate exit.  Do not continue along the gate
             # normal toward/over the pole; gate 4 planning starts immediately from this point.
             self._current_exit = climb.copy()
-            waypoints = [start, climb]
+            waypoints = [start, climb_base, climb]
             self._overhead_transfer_active = True
             self._overhead_transfer_height = transfer_z
         else:

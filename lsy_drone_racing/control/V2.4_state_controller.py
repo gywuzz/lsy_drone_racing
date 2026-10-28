@@ -1,4 +1,45 @@
+from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import numpy as np
+from crazyflow.sim.visualize import draw_line, draw_points
+from scipy.interpolate import PchipInterpolator
+from scipy.spatial.transform import Rotation as R
+
+from lsy_drone_racing.control import Controller
+
+if TYPE_CHECKING:
+    from crazyflow import Sim
+    from numpy.typing import NDArray
+
+
+class V2StateController(Controller):
+    """Fly to each recorded entry, pass the gate, then select the next ordered entry."""
+
+    def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
+        super().__init__(obs, info, config)
+
+        self._freq = float(config.env.freq)
+        self._cruise_speed = 0.80
+        self._alignment_speed = 0.38
+        self._gate_speed = 0.32
+        self._gate_offset = 0.45
+        self._gate_alignment_start_offset = 0.30
+        self._gate_alignment_offset = 0.12
+        self._gate_bypass_offset = 0.62
+        self._takeoff_height = 0.45
+        self._minimum_segment_time = 0.24
+        self._obstacle_clearance = 0.30
+        self._avoidance_margin = 0.08
+        self._avoidance_lookahead = 0.28
+        self._entry_tolerance = 0.09
+        self._alignment_tolerance = 0.10
+        self._exit_tolerance = 0.18
+        self._tracking_slowdown_distance = 0.45
+        # A pole may sit on a gate's centreline (gate 4 in level 2).  The normal
+        # 0.30 m alignment point is then unsafe even though the gate itself is clear.
+        self._alignment_min_offset = 0.14
         self._alignment_obstacle_clearance = 0.27
 
         # [CHANGE 1] Return path over the top of a gate instead of around its side.
@@ -561,3 +602,4 @@
         setpoint = self._local_spline(self._trajectory_time).reshape(1, -1)
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
         draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.025)
+       

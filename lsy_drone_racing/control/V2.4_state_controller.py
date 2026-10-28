@@ -23,7 +23,7 @@ class V2StateController(Controller):
         self._freq = float(config.env.freq)
         self._cruise_speed = 0.80
         self._alignment_speed = 0.38
-        self._gate_speed = 0.32
+        self._gate_speed = 0.80
         self._gate_offset = 0.45
         self._gate_alignment_start_offset = 0.30
         self._gate_alignment_offset = 0.12

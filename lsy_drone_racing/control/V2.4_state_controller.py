@@ -41,7 +41,7 @@ class V2StateController(Controller):
         # Start -> gate 1: only detour for obstacles that truly enter a narrow flight corridor.
         self._initial_transfer_clearance = 0.30
         # Gate 1 -> gate 2: clear the first gate before climbing toward the higher second gate.
-        self._first_gate_climb_offset = 0.28
+        self._first_gate_climb_offset = 0.42
         self._first_gate_climb_speed = 0.50
         self._height_difference_threshold = 0.08
         self._second_gate_turn_distance = 0.42
@@ -76,6 +76,8 @@ class V2StateController(Controller):
         self._overhead_transfer_active = False
         self._overhead_transfer_height = 0.0
         self._first_to_second_transfer_active = False
+        self._first_to_second_turn_point = np.zeros(3, dtype=np.float64)
+        self._first_to_second_frozen_entry = np.zeros(3, dtype=np.float64)
 
         self._known_gate_poses: dict[
             int, tuple[NDArray[np.float64], NDArray[np.float64]]
@@ -232,18 +234,12 @@ class V2StateController(Controller):
             )
             turn_point[2] = max(float(route_start[2]), float(self._current_entry[2]))
             obstacles = self._available_obstacles(obs)
-            first_leg = self._obstacle_aware_transfer(
-                route_start, turn_point, obstacles
-            )
-            waypoints.extend(first_leg)
-            second_leg_start = waypoints[-1]
+            self._first_to_second_turn_point = turn_point.copy()
             waypoints.extend(
-                self._obstacle_aware_transfer(
-                    second_leg_start, self._current_entry, obstacles
-                )
+                self._obstacle_aware_transfer(route_start, turn_point, obstacles)
             )
             self._departure_gate = None
-            self._phase = "TO_ENTRY"
+            self._phase = "FIRST_TO_SECOND_TURN"
             self._set_local_plan(waypoints, self._first_to_second_speed)
             return
 
@@ -289,6 +285,23 @@ class V2StateController(Controller):
         )
         self._phase = "TO_ENTRY"
         self._set_local_plan(waypoints, self._cruise_speed)
+
+    def _plan_first_to_second_entry_leg(
+        self, obs: dict[str, NDArray[np.floating]]
+    ) -> None:
+        """Freeze gate 2's entry and fly the final side of the U independently."""
+        start = np.asarray(obs["pos"], dtype=np.float64)
+        self._first_to_second_frozen_entry = self._current_entry.copy()
+        waypoints = [start]
+        waypoints.extend(
+            self._obstacle_aware_transfer(
+                start,
+                self._first_to_second_frozen_entry,
+                self._available_obstacles(obs),
+            )
+        )
+        self._phase = "FIRST_TO_SECOND_ENTRY"
+        self._set_local_plan(waypoints, self._first_to_second_speed)
 
     def _build_departure_bypass(
         self,
@@ -671,6 +684,21 @@ class V2StateController(Controller):
             settled_close_enough = self._local_plan_finished() and alignment_error < 0.16
             if alignment_reached or settled_close_enough:
                 self._plan_through_gate(obs)
+        elif self._phase == "FIRST_TO_SECOND_TURN":
+            turn_error = np.linalg.norm(
+                position - self._first_to_second_turn_point
+            )
+            if turn_error < self._entry_tolerance or self._local_plan_finished():
+                self._plan_first_to_second_entry_leg(obs)
+        elif self._phase == "FIRST_TO_SECOND_ENTRY":
+            entry_error = np.linalg.norm(
+                position - self._first_to_second_frozen_entry
+            )
+            if entry_error < self._entry_tolerance or self._local_plan_finished():
+                self._current_entry = self._first_to_second_frozen_entry.copy()
+                self._first_to_second_transfer_active = False
+                self._departure_gate = None
+                self._plan_gate_alignment(obs)
         elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
             exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
             if exit_reached or self._local_plan_finished():

@@ -27,8 +27,6 @@ class V2StateController(Controller):
         self._gate_offset = 0.45
         self._gate_alignment_start_offset = 0.30
         self._gate_alignment_offset = 0.12
-        self._alignment_min_offset = 0.14
-        self._alignment_obstacle_clearance = 0.28
         self._gate_bypass_offset = 0.62
         self._takeoff_height = 0.45
         self._minimum_segment_time = 0.24
@@ -40,17 +38,14 @@ class V2StateController(Controller):
         self._exit_tolerance = 0.18
         self._tracking_slowdown_distance = 0.45
 
-        # Physical gate 3 is index 2 in the zero-based gate arrays.  Immediately after this
-        # gate, switch from the fixed gate-crossing trajectory to an obstacle-aware exit plan.
-        self._post_gate_avoidance_gate_id = 2
-        self._post_gate_speed = 0.45
+        # Only the third pass uses a vertical departure.  The first two passes keep V2.2's
+        # original waypoints, speeds and state transitions unchanged.
+        self._vertical_departure_pass_index = 2
+        self._vertical_departure_speed = 0.50
+        self._third_gate_top_clearance = 0.18
+        self._vertical_column_clearance = 0.28
         self._post_gate_corridor_width = 0.42
         self._post_gate_corridor_length = 0.90
-        self._post_gate_target_margin = 0.08
-        self._post_gate_exit_tolerance = 0.14
-        self._post_gate_settle_speed = 0.18
-        self._post_gate_settle_steps_required = max(1, int(round(0.25 * self._freq)))
-        self._post_gate_settle_steps = 0
 
         # [CHANGE 1] Return path over the top of a gate instead of around its side.
         # "over": fly above the gate frame (falls back to "side" if the required height exceeds
@@ -69,6 +64,8 @@ class V2StateController(Controller):
         self._phase = "TO_ENTRY"
         self._finished = False
         self._desired_yaw = 0.0
+        self._overhead_transfer_active = False
+        self._overhead_transfer_height = 0.0
 
         self._known_gate_poses: dict[
             int, tuple[NDArray[np.float64], NDArray[np.float64]]
@@ -203,6 +200,18 @@ class V2StateController(Controller):
             waypoints.append(takeoff)
 
         route_start = waypoints[-1]
+        if self._overhead_transfer_active:
+            # Hold the gate-clearance height until directly over gate 4's already-shifted safe
+            # entry point.  The route heads away from the gate-3 pole instead of crossing it.
+            climb_or_hold = route_start.copy()
+            climb_or_hold[2] = self._overhead_transfer_height
+            above_entry = self._current_entry.copy()
+            above_entry[2] = self._overhead_transfer_height
+            waypoints.extend([climb_or_hold, above_entry, self._current_entry.copy()])
+            self._phase = "TO_ENTRY"
+            self._set_local_plan(waypoints, self._vertical_departure_speed)
+            return
+
         # [CHANGE 2] A re-plan inside TO_ENTRY (newly seen gate/pole) used to call this without
         # departure_gate, so the bypass vanished and the new straight line could lead back
         # through the gate just passed.  Reuse the stored gate instead.
@@ -313,44 +322,40 @@ class V2StateController(Controller):
         alignment_exit = (
             self._current_center + self._gate_alignment_offset * self._current_normal
         )
-        waypoints = [
-            start,
-            alignment_entry,
-            self._current_center,
-            alignment_exit,
-        ]
-        # Gate 3 has a pole almost directly behind it.  End its fast crossing as soon as the
-        # drone is safely through the plane; the slower post-gate corridor takes over there.
-        if self._current_gate_id != self._post_gate_avoidance_gate_id:
-            alignment_after = (
-                self._current_center
-                + self._gate_alignment_start_offset * self._current_normal
-            )
+        alignment_after = (
+            self._current_center
+            + self._gate_alignment_start_offset * self._current_normal
+        )
+        waypoints = [start, alignment_entry, self._current_center, alignment_exit]
+        if self._pass_index != self._vertical_departure_pass_index:
+            # Exact V2.2 crossing for every pass except the third one.
             waypoints.extend([alignment_after, self._current_exit])
         self._phase = "THROUGH_GATE"
         self._set_local_plan(waypoints, self._gate_speed)
 
-    def _plan_post_gate_exit(
+    def _plan_third_gate_departure(
         self, obs: dict[str, NDArray[np.floating]]
     ) -> None:
-        """Replan gate 3's exit only after the gate counter confirms a valid pass.
-
-        Keeping this separate from THROUGH_GATE preserves the straight, centered crossing;
-        avoidance starts from the drone's measured post-gate position.
-        """
+        """Climb above gate 3, then hand off directly to the gate-4 entry route."""
         self._obstacles_visited = np.asarray(
             obs["obstacles_visited"], dtype=bool
         ).copy()
         self._update_known_objects(obs)
         obstacles = self._available_obstacles(obs)
-        normal_xy = self._current_normal[:2].copy()
-        normal_xy /= max(np.linalg.norm(normal_xy), 1e-9)
+        start = np.asarray(obs["pos"], dtype=np.float64)
+
+        normal_h = np.array(
+            [self._current_normal[0], self._current_normal[1], 0.0],
+            dtype=np.float64,
+        )
+        normal_h /= max(np.linalg.norm(normal_h), 1e-9)
         departure_distance = self._gate_offset
+        blocking = np.empty(0, dtype=np.int64)
         if len(obstacles):
             relative_xy = obstacles[:, :2] - self._current_center[:2]
-            forward = relative_xy @ normal_xy
+            forward = relative_xy @ normal_h[:2]
             lateral = np.linalg.norm(
-                relative_xy - forward[:, None] * normal_xy, axis=1
+                relative_xy - forward[:, None] * normal_h[:2], axis=1
             )
             blocking = np.flatnonzero(
                 (forward > self._gate_alignment_offset)
@@ -358,37 +363,60 @@ class V2StateController(Controller):
                 & (lateral < self._post_gate_corridor_width)
             )
             if len(blocking):
-                furthest_forward = float(np.max(forward[blocking]))
                 departure_distance = max(
                     departure_distance,
-                    furthest_forward
-                    + self._obstacle_clearance
-                    + self._post_gate_target_margin,
+                    float(np.max(forward[blocking])) + self._obstacle_clearance,
                 )
 
-        # Finish beyond the blocking pole, so the subsequent route to gate 4 cannot cut back
-        # across it immediately after the lateral detour.
-        self._current_exit = (
-            self._current_center + departure_distance * self._current_normal
+        gate_clear_z = (
+            self._current_center[2]
+            + self._gate_frame_half_height
+            + self._third_gate_top_clearance
         )
-        start = np.asarray(obs["pos"], dtype=np.float64)
-        waypoints = [start]
-        waypoints.extend(
-            self._obstacle_aware_transfer(start, self._current_exit, obstacles)
+        # This is intentionally based on the top of gate 3, not the top of the pole.  Once the
+        # drone has climbed, the next segment heads directly away from that pole toward gate 4.
+        transfer_z = max(float(start[2]), gate_clear_z)
+        column_clearance = (
+            float(np.min(np.linalg.norm(obstacles[:, :2] - start[:2], axis=1)))
+            if len(obstacles)
+            else np.inf
         )
-        self._phase = "TO_EXIT"
-        self._post_gate_settle_steps = 0
-        self._set_local_plan(waypoints, self._post_gate_speed)
+        can_climb = (
+            transfer_z <= self._max_flight_height
+            and column_clearance >= self._vertical_column_clearance
+        )
 
-    def _refresh_post_gate_exit_if_obstacle_seen(
+        if can_climb:
+            climb = start.copy()
+            climb[2] = transfer_z
+            # The vertical climb itself is the third-gate exit.  Do not continue along the gate
+            # normal toward/over the pole; gate 4 planning starts immediately from this point.
+            self._current_exit = climb.copy()
+            waypoints = [start, climb]
+            self._overhead_transfer_active = True
+            self._overhead_transfer_height = transfer_z
+        else:
+            # Low ceiling or a pole too close to the climb column: retain a safe horizontal
+            # fallback rather than forcing an unsafe ascent.
+            target = self._current_center + departure_distance * self._current_normal
+            target = self._move_staging_point(target, self._current_normal, obstacles)
+            self._current_exit = target
+            waypoints = [start]
+            waypoints.extend(self._obstacle_aware_transfer(start, target, obstacles))
+            self._overhead_transfer_active = False
+
+        self._phase = "TO_EXIT"
+        self._set_local_plan(waypoints, self._vertical_departure_speed)
+
+    def _third_gate_obstacle_newly_seen(
         self, obs: dict[str, NDArray[np.floating]]
     ) -> bool:
-        """Refresh gate 3's exit route when a pole first appears after the pass."""
-        old_obstacles_visited = self._obstacles_visited.copy()
+        """Report a newly revealed pole while executing the third-gate departure."""
+        old_visited = self._obstacles_visited.copy()
         self._obstacles_visited = np.asarray(
             obs["obstacles_visited"], dtype=bool
         ).copy()
-        newly_seen = np.any(self._obstacles_visited & ~old_obstacles_visited)
+        newly_seen = np.any(self._obstacles_visited & ~old_visited)
         if newly_seen:
             self._update_known_objects(obs)
         return bool(newly_seen)
@@ -396,42 +424,12 @@ class V2StateController(Controller):
     def _plan_gate_alignment(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Move to a centered point in front of the gate before starting the crossing."""
         start = np.asarray(obs["pos"], dtype=np.float64)
-        alignment_start = self._alignment_start(obs)
-        waypoints = [start]
-        waypoints.extend(
-            self._obstacle_aware_transfer(
-                start, alignment_start, self._available_obstacles(obs)
-            )
+        alignment_start = (
+            self._current_center
+            - self._gate_alignment_start_offset * self._current_normal
         )
         self._phase = "ALIGN_GATE"
-        self._set_local_plan(waypoints, self._alignment_speed)
-
-    def _alignment_start(
-        self, obs: dict[str, NDArray[np.floating]]
-    ) -> NDArray[np.float64]:
-        """Choose a safe point on the gate normal, especially for gate 4's nearby pole."""
-        obstacles = self._available_obstacles(obs)
-        offsets = np.linspace(
-            self._gate_alignment_start_offset, self._alignment_min_offset, 9
-        )
-        candidates = [
-            self._current_center - offset * self._current_normal
-            for offset in offsets
-        ]
-        if not len(obstacles):
-            return candidates[0]
-        for candidate in candidates:
-            clearance = np.min(
-                np.linalg.norm(obstacles[:, :2] - candidate[:2], axis=1)
-            )
-            if clearance >= self._alignment_obstacle_clearance:
-                return candidate
-        return max(
-            candidates,
-            key=lambda point: np.min(
-                np.linalg.norm(obstacles[:, :2] - point[:2], axis=1)
-            ),
-        )
+        self._set_local_plan([start, alignment_start], self._alignment_speed)
 
     def _obstacle_aware_transfer(
         self,
@@ -545,18 +543,6 @@ class V2StateController(Controller):
         """Return whether the active local trajectory has reached its final setpoint."""
         return self._trajectory_time >= self._trajectory_duration - 1e-6
 
-    def _finish_exit_transition(
-        self, obs: dict[str, NDArray[np.floating]]
-    ) -> None:
-        """Select the next gate after the exit corridor has genuinely settled."""
-        assert self._pending_pass_index is not None
-        previous_gate = (self._current_center.copy(), self._current_normal.copy())
-        self._pass_index = self._pending_pass_index
-        self._pending_pass_index = None
-        self._post_gate_settle_steps = 0
-        self._select_current_gate(obs)
-        self._plan_to_entry(obs, departure_gate=previous_gate)
-
     def _advance_phase(self, obs: dict[str, NDArray[np.floating]]) -> None:
         """Advance phases without changing the configured gate order."""
         position = np.asarray(obs["pos"], dtype=np.float64)
@@ -566,52 +552,27 @@ class V2StateController(Controller):
             # drone from reaching its strict radius, move on to the centered alignment target once
             # the entry trajectory has completed instead of holding forever.
             if entry_reached or self._local_plan_finished():
+                self._overhead_transfer_active = False
                 self._departure_gate = None  # [CHANGE 2]
                 self._plan_gate_alignment(obs)
         elif self._phase == "ALIGN_GATE":
-            alignment_start = self._alignment_start(obs)
+            alignment_start = (
+                self._current_center
+                - self._gate_alignment_start_offset * self._current_normal
+            )
             alignment_error = np.linalg.norm(position - alignment_start)
             alignment_reached = alignment_error < self._alignment_tolerance
             settled_close_enough = self._local_plan_finished() and alignment_error < 0.16
             if alignment_reached or settled_close_enough:
                 self._plan_through_gate(obs)
         elif self._phase == "TO_EXIT" and self._pending_pass_index is not None:
-            specialized_exit = (
-                self._current_gate_id == self._post_gate_avoidance_gate_id
-            )
-            tolerance = (
-                self._post_gate_exit_tolerance
-                if specialized_exit
-                else self._exit_tolerance
-            )
-            exit_reached = np.linalg.norm(position - self._current_exit) < tolerance
-            if specialized_exit and exit_reached:
-                self._phase = "POST_GATE_SETTLE"
-                self._post_gate_settle_steps = 0
-                self._set_local_plan(
-                    [position, self._current_exit], self._post_gate_speed
-                )
-            elif not specialized_exit and (
-                exit_reached or self._local_plan_finished()
-            ):
-                self._finish_exit_transition(obs)
-        elif (
-            self._phase == "POST_GATE_SETTLE"
-            and self._pending_pass_index is not None
-        ):
-            position_error = np.linalg.norm(position - self._current_exit)
-            horizontal_speed = np.linalg.norm(
-                np.asarray(obs["vel"], dtype=np.float64)[:2]
-            )
-            if (
-                position_error < self._post_gate_exit_tolerance
-                and horizontal_speed < self._post_gate_settle_speed
-            ):
-                self._post_gate_settle_steps += 1
-            else:
-                self._post_gate_settle_steps = 0
-            if self._post_gate_settle_steps >= self._post_gate_settle_steps_required:
-                self._finish_exit_transition(obs)
+            exit_reached = np.linalg.norm(position - self._current_exit) < self._exit_tolerance
+            if exit_reached or self._local_plan_finished():
+                previous_gate = (self._current_center.copy(), self._current_normal.copy())
+                self._pass_index = self._pending_pass_index
+                self._pending_pass_index = None
+                self._select_current_gate(obs)
+                self._plan_to_entry(obs, departure_gate=previous_gate)
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -623,10 +584,10 @@ class V2StateController(Controller):
             self._plan_to_entry(obs)
         elif (
             self._phase == "TO_EXIT"
-            and self._current_gate_id == self._post_gate_avoidance_gate_id
-            and self._refresh_post_gate_exit_if_obstacle_seen(obs)
+            and self._pass_index == self._vertical_departure_pass_index
+            and self._third_gate_obstacle_newly_seen(obs)
         ):
-            self._plan_post_gate_exit(obs)
+            self._plan_third_gate_departure(obs)
         self._advance_phase(obs)
 
         tracking_error = np.linalg.norm(
@@ -686,15 +647,15 @@ class V2StateController(Controller):
         total_passes = len(obs["gate_sequence"])
         self._finished = gates_passed >= total_passes
 
-        if (
-            not self._finished
-            and gates_passed > self._pass_index
-            and self._pending_pass_index is None
-        ):
+        if not self._finished and gates_passed > self._pass_index:
+            first_exit_update = self._pending_pass_index is None
             self._pending_pass_index = gates_passed
             self._phase = "TO_EXIT"
-            if self._current_gate_id == self._post_gate_avoidance_gate_id:
-                self._plan_post_gate_exit(obs)
+            if (
+                self._pass_index == self._vertical_departure_pass_index
+                and first_exit_update
+            ):
+                self._plan_third_gate_departure(obs)
         return self._finished
 
     def episode_callback(self):
@@ -709,4 +670,5 @@ class V2StateController(Controller):
         setpoint = self._local_spline(self._trajectory_time).reshape(1, -1)
         draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
         draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.025)
+
        

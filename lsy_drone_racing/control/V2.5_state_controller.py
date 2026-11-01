@@ -38,7 +38,7 @@ class V3StateController(Controller):
         self._avoidance_margin = 0.08
         self._avoidance_lookahead = 0.20
         self._entry_tolerance = 0.12
-        self._alignment_tolerance = 0.12
+        self._alignment_tolerance = 0.10
         self._exit_tolerance = 0.18
         self._tracking_slowdown_distance = 0.52
         self._minimum_time_scale = 0.48
